@@ -1,0 +1,301 @@
+#!/bin/sh
+set -e
+#ENVIROIMENT VARS
+[ -z $EDITOR ] && EDITOR=nano
+[ -z $MATRIX_INSTALL_PATH ] && MATRIX_INSTALL_PATH="$HOME/.local/share/installs/matrix"
+[ -z $MATRIX_BRIDGES_PATH ] && MATRIX_BRIDGES_PATH=$MATRIX_INSTALL_PATH/bridges
+[ -z $HOSTNAME ] && HOSTNAME=$(hostname)
+
+env_file="$HOME/.zshenv"
+
+#SERVER SHORT NAME
+synapse=$MATRIX_INSTALL_PATH/server
+#BRIDGES
+bridge_irc=$MATRIX_BRIDGES_PATH/matrix-irc
+bridge_telegram=$MATRIX_BRIDGES_PATH/mautrix-telegram
+bridge_whatsapp=$MATRIX_BRIDGES_PATH/mautrix-whatsapp
+
+update_key(){
+  key="$1"
+  value="$2"
+  file="$3"
+  sed -i -r "s|(($key)(.*))|\2 $value|" $file
+}
+
+replace_in_file(){
+  search_content="$1"
+  replace_by="$2"
+  file="$3"
+  sed -i -r "s|$search_content|$replace_by|" $file
+}
+
+insert_after_match(){
+  search_content="$1"
+  insert_line="$2"
+  file="$3"
+  sed -i -r "s|$search_content|&$insert_line|" $file
+}
+
+show_help(){
+  tabs="\t\t\t"
+  echo "matrix: "
+  echo "-e                      $tabs  edita esse script"
+  echo "-is --install-server    $tabs  instala somente o matrix-server"
+  echo "-rs --reinstall-server  $tabs  reinstala somente o matrix-server"
+  echo "-iab --install-all-bridges    $tabs  instala todas as bridges"
+  echo "-rab --reinstall-all-bridges  $tabs  reinstala todas as bridges"
+  echo "-ess --edit-server-settings  $tabs  edita as configurações do homeserver"
+  echo "--bridges                 $tabs  inicia todas as bridges"
+  echo "--start                      $tabs  inicia o matrix-server apenas"
+  echo "--stop                      $tabs  para o matrix-server apenas"
+}
+
+start_server(){
+  cd $synapse
+  . $synapse/.env/bin/activate
+  synctl start
+}
+
+stop_server(){
+  cd $synapse
+  . $synapse/.env/bin/activate
+  synctl stop
+}
+
+help(){
+  echo "-h --help para mostrar ajuda"
+}
+
+edit_server_settings(){
+  $EDITOR $synapse/homeserver.yaml
+}
+
+uncomment_and_update_key(){
+  key="$1"
+  value="$2"
+  file="$3"
+  sed -i -r "s|(\#($key)(.*))|\2 $value|p" $file
+}
+
+server_setup(){
+  uncomment_and_update_key "enable_registration:" "true" "$synapse/homeserver.yaml"
+
+  #DELETE EXAMPLE APP_SERVICES
+  sed -i '1501,1502d' "$synapse/homeserver.yaml"
+  start_server
+  register_new_matrix_user -c $synapse/homeserver.yaml "http://localhost:8008"
+  stop_server
+
+  #echo "- $bridge_irc/registration.yaml" >> $synapse/homeserver.yaml
+}
+
+reinstall_server(){
+  echo "Alerta Potencial Risco de perda de Arquivos a frente, proceda com cautela"
+  rm -rif $synapse
+  install_server reinstall
+}
+
+install_server(){
+  option="$1"
+  _type="instalado"
+  if [ "$option" = "reinstall" ]; then
+    _type="reinstalado"
+  fi
+
+  echo "Criando virtual env..."
+
+  virtualenv -p python3 $synapse/.env
+  $synapse/.env/bin/python3 -m pip  install --upgrade pip
+  $synapse/.env/bin/python3 -m pip  install --upgrade setuptools
+  $synapse/.env/bin/python3 -m pip  install matrix-synapse
+  cd $synapse 
+  $synapse/.env/bin/python3 -m synapse.app.homeserver --server-name $HOSTNAME --config-path homeserver.yaml --generate-config --report-stats=yes
+  echo "Escrevendo configurações no servidor..."
+  server_setup
+  echo "Matrix Synapse $_type"
+}
+
+#  =====  BRIDGES ==== 
+
+#BRIDGE TELEGRAM
+setup_whatsapp(){
+  version="v0.1.6"
+  executable="https://github.com/tulir/mautrix-whatsapp/releases/download/$version/mautrix-whatsapp-amd64"
+  example_config="https://raw.githubusercontent.com/tulir/mautrix-whatsapp/$version/example-config.yaml"
+
+  mkdir -p "$bridge_whatsapp"
+  wget "$executable" -O "$bridge_whatsapp/mautrix-whatsapp"
+  wget "$example_config" -O "$bridge_whatsapp/example-config.yaml"
+  cp "$bridge_whatsapp/example-config.yaml" "$bridge_whatsapp/config.yaml"
+  chmod +x "$bridge_whatsapp/mautrix-whatsapp"
+
+  replace_in_file "https://example.com" "http://localhost:8008" "$bridge_whatsapp/config.yaml"
+  update_key "domain:" "$HOSTNAME" "$bridge_whatsapp/config.yaml"
+  replace_in_file "admin:example.com" "rodrigo:$HOSTNAME" "$bridge_whatsapp/config.yaml"
+  replace_in_file "\"example.com\"" "\"$HOSTNAME\"" "$bridge_whatsapp/config.yaml"
+
+  replace_in_file "#app_service_config_files:" "app_service_config_files:" "$synapse/homeserver.yaml"
+  insert_after_match "app_service_config_files:" "\n - $bridge_whatsapp/registration.yaml" "$synapse/homeserver.yaml"
+
+  #GENERATE registration.yaml
+  "$bridge_whatsapp/mautrix-whatsapp" -c "$bridge_whatsapp/config.yaml" -r "$bridge_whatsapp/registration.yaml" -g
+}
+
+bridge_start_whatsapp(){
+  "$bridge_whatsapp/mautrix-whatsapp" -c "$bridge_whatsapp/config.yaml" &
+}
+
+bridge_install_whatsapp(){
+  # ENSURE THAT MATRIX_SYNAPSE IS RUNNING BEFORE GENERATE REGISTRATION FILE
+  start_server
+  setup_whatsapp
+  stop_server
+}
+
+# TELEGRAM BRIDGE
+setup_telegram(){
+  version="v0.9.0"
+  example_config="https://raw.githubusercontent.com/tulir/mautrix-telegram/$version/mautrix_telegram/example-config.yaml"
+  alembic_ini="https://raw.githubusercontent.com/tulir/mautrix-telegram/$version/alembic.ini"
+
+  # Copy alembic folder
+  git clone --no-checkout "https://github.com/tulir/mautrix-telegram/" "$bridge_telegram"
+  cd "$bridge_telegram"
+  git sparse-checkout set alembic
+
+  # DOWNLOAD STUFF
+  wget $example_config -O "$bridge_telegram/example-config.yaml"
+  wget $alembic_ini -O "$bridge_telegram/alembic.ini"
+  
+  #PRE-SETUP
+  cp "$bridge_telegram/example-config.yaml" "$bridge_telegram/config.yaml"
+
+  #VIRTUAL ENV STUFF
+  virtualenv -p python3 "$bridge_telegram/.env"
+  "$bridge_telegram/.env/bin/python3" -m pip install "sqlalchemy>=1.2,<1.4"
+  "$bridge_telegram/.env/bin/python3" -m pip install "mautrix-telegram[all]==$version"
+
+  replace_in_file "https://example.com" "http://localhost:8008" "$bridge_telegram/config.yaml"
+  update_key "domain:" "$HOSTNAME" "$bridge_telegram/config.yaml"
+  replace_in_file "admin:example.com" "rodrigo:$HOSTNAME" "$bridge_telegram/config.yaml"
+  replace_in_file "\"example.com\"" "\"$HOSTNAME\"" "$bridge_telegram/config.yaml"
+
+  echo "Essa Bridge precisa de credenciais do telegram para prosseguir"
+  echo "Será Aberta uma janela em seu navegador para o site do Telegram"
+  echo "Pressione Qualquer tecla para Prosseguir"
+  read go
+  xdg-open "https://my.telegram.org/apps"
+  echo "Informe sua api_id:"
+  read api_id
+  echo "Informe sua api_hash:"
+  read api_hash
+
+  update_key "api_id:" "$api_id" "$bridge_telegram/config.yaml"
+  update_key "api_hash:" "$api_hash" "$bridge_telegram/config.yaml"
+
+  replace_in_file "#app_service_config_files:" "app_service_config_files:" "$synapse/homeserver.yaml"
+  insert_after_match "app_service_config_files:" "\n - $bridge_telegram/registration.yaml" "$synapse/homeserver.yaml"
+
+  #JUST TO LOAD ALEMBIC
+  . "$bridge_telegram/.env/bin/activate"
+
+  #cd "$bridge_telegram"
+
+  update_key "script_location =" "$bridge_telegram/alembic" "$bridge_telegram/alembic.ini"
+  alembic -x config="$bridge_telegram/config.yaml" -c "$bridge_telegram/alembic.ini" upgrade head
+
+  #GENERATE REGISTRATION FILE
+  "$bridge_telegram/.env/bin/python3" -m mautrix_telegram -c "$bridge_telegram/config.yaml" -r "$bridge_telegram/registration.yaml" -g 
+}
+
+bridge_start_telegram(){
+  "$bridge_telegram/.env/bin/python3" -m mautrix_telegram -c "$bridge_telegram/config.yaml" &
+}
+
+bridge_install_telegram(){
+  start_server
+  setup_telegram
+  stop_server
+}
+
+#IRC BRIDGE
+bridge_irc_port=9999
+config_file="$bridge_irc/config.yaml"
+setup_irc(){
+  irc_network_url="chat.freenode.net"
+  bot_name="ircbot"
+
+  git clone --no-checkout "https://github.com/matrix-org/matrix-appservice-irc" "$bridge_irc"
+  cd "$bridge_irc"
+  git sparse-checkout set scripts spec src app.js config.schema.yml config.sample.yaml package.json tsconfig.json 
+
+  cp config.sample.yaml config.yaml
+  update_key "domain:" "\"lenovo\"" $config_file
+  replace_in_file "irc.example.com" $irc_network_url $config_file
+  replace_in_file "additionalAddresses" "#additionalAddresses" $config_file
+  replace_in_file "passwordEncryptionKeyPath:" "#passwordEncryptionKeyPath" $config_file
+  replace_in_file "# '\*': admin" " '*': admin" $config_file
+  update_key "connectionString:" '"postgres://ircbridge:s3cr3t@localhost:5432/ircbridge"' $config_file
+  insert_after_match "app_service_config_files:" "\n - $bridge_irc/registration.yaml" "$synapse/homeserver.yaml"
+
+  ##LOAD NODE
+  . "$env_file"
+  eval "$(fnm env)"
+
+  ##BUILD
+  npm install
+  
+  #GENERATE REGISTRATION
+  node "$bridge_irc/app.js" -c $config_file -f "$bridge_irc/registration.yaml" -u "http://localhost:$bridge_irc_port" -l $bot_name -r 
+}
+
+bridge_start_irc(){
+  #LOAD NODE
+  node_executable="$HOME/.local/share/fnm/aliases/default/bin/node"
+  eval "$(fnm env)"
+  "$node_executable" "$bridge_irc/app.js" -c "$config_file" -f "$bridge_irc/registration.yaml" -p $bridge_irc_port &
+}
+
+bridge_install_irc(){
+  start_server
+  setup_irc
+  stop_server
+}
+
+
+install_all_bridges(){
+  bridge_install_telegram
+  bridge_install_whatsapp
+  bridge_install_irc
+}
+
+start_all_bridges(){
+   bridge_start_irc
+   bridge_start_telegram
+   bridge_start_whatsapp
+}
+
+[ -z $1 ] && help
+
+for arg in $@; do
+  case $arg in
+    -e)
+      $EDITOR $0;;
+    -h | --help)
+      show_help;;
+    -is | --install_server)
+      install_server;;
+    -rs | --reinstall-server)
+      reinstall_server;;
+    -iab)
+      install_all_bridges;;
+    --bridges)
+      start_all_bridges;;
+    --start)
+      start_server;;
+    --stop)
+      stop_server;;
+    -ess | --edit-serve-settings)
+      edit_server_settings;;
+  esac
+done
